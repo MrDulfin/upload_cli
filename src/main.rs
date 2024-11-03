@@ -22,8 +22,6 @@ async fn main() -> Result<(), String> {
 
     let url = config.url.clone();
 
-    // TODO: load default
-
     let exec_name = Path::new(&args.next().unwrap()).file_name().unwrap().to_str().unwrap().to_string();
     if let Some(arg) = args.next() {
         match arg.to_lowercase().as_str() {
@@ -177,6 +175,10 @@ async fn upload_file(name: String, file: File, client: &Client, url: String, dur
 }
 
 async fn set(mut args: Args, mut config: Config) {
+    let mut args = args.peekable();
+    if args.peek().is_none() {
+        panic!("shouldn't have done that. give me something to set")
+    }
     loop {
         if let Some(arg) = args.next() {
             match arg.to_lowercase().as_str() {
