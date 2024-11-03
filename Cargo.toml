@@ -1,10 +1,13 @@
 [package]
-name = "upload_cli"
+name = "confetti_cli"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 chrono = { version = "0.4.38", features = ["serde"] }
+colored = "2.1.0"
+directories = "5.0.1"
+dirs = "5.0.1"
 futures = "0.3.31"
 indicatif = "0.17.8"
 moro = "0.4.0"
