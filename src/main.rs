@@ -1,4 +1,4 @@
-use std::{env::{args, Args}, fs, io::{Read, Write}, path::Path};
+use std::{env::{args, Args}, fs, io::{Read, Write}, path::Path, sync::atomic::AtomicI64};
 
 use chrono::{DateTime, Utc};
 
@@ -31,22 +31,74 @@ async fn main() -> Result<(), String> {
             "upload" => {
                 if let Some(path) = args.next() {
                     let mut first = true;
-                    let mut files: Vec<(tokio::fs::File, Option<String>)> = vec![];
+                    let mut files: Vec<Upload> = vec![];
+                    let info = config.info.as_ref().unwrap();
+                    let mut duration_all = None;
                     loop {
                         let path: String = if !first {
                             match args.next() {
                                 Some(arg) => match arg.to_lowercase().as_str() {
                                     x if x == "-n" || x == "--name" => {
-                                        let x = match args.next() {
+                                        let file_name = match args.next() {
                                             Some(arg) => arg,
                                             None => {
                                                 println!("ERROR: Provide a file name");
                                                 return Ok(());
                                             }
                                         };
-                                        files.last_mut().unwrap().1 = Some(x);
+                                        files.last_mut().unwrap().name = file_name;
                                         continue;
                                     },
+                                    x if x == "-d" || x == "--duration" => {
+                                        match args.next() {
+                                            Some(dur) => {
+                                                if let Ok(dur) = dur.parse::<u32>() {
+                                                    if info.allowed_durations.contains(&dur) {
+                                                        files.last_mut().unwrap().duration = dur as i64;
+                                                    } else {
+                                                        print!("ERROR: {} is not a supported duration.\nPlease choose from ", dur.to_string().bold());
+                                                        let len = info.allowed_durations.len();
+                                                        for (i, dur_) in info.allowed_durations.iter().enumerate() {
+                                                            print!("{}{}",dur_.to_string().bold(), if i+1 < len { ", " } else { ".\n" });
+                                                        }
+                                                        return Ok(());
+                                                    }
+                                                } else {
+                                                    println!("ERROR: Provide a valid duration");
+                                                    return Ok(());
+                                                }
+                                            },
+                                            None => {
+                                                println!("ERROR: Provide a valid duration");
+                                                return Ok(());
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    x if x == "-da" || x == "--duration-all" => {
+                                        if let Some(dur) = args.next() {
+                                            if let Ok(dur) = dur.parse::<u32>() {
+                                                if info.allowed_durations.contains(&dur) {
+                                                    duration_all = Some(dur);
+                                                } else {
+                                                    print!("ERROR: {} is not a supported duration.\nPlease choose from ", dur.to_string().bold());
+                                                    let len = info.allowed_durations.len();
+                                                    for (i, dur_) in info.allowed_durations.iter().enumerate() {
+                                                        print!("{}{}",dur_.to_string().bold(), if i+1 < len { ", " } else { ".\n" });
+                                                    }
+                                                    return Ok(());
+                                                }
+
+                                            } else {
+                                                println!("ERROR: Provide a valid duration");
+                                                return Ok(());
+                                            }
+                                        } else {
+                                            println!("ERROR: Provide a valid duration");
+                                            return Ok(());
+                                        }
+                                        continue;
+                                    }
                                     _ => arg
                                 },
                                 None => break
@@ -57,16 +109,27 @@ async fn main() -> Result<(), String> {
                         };
                         let file = tokio::fs::OpenOptions::new().read(true).open(&path).await;
                         if let Err(err) = file {
-                            return Err(err.to_string());
+                            panic!("{} {}", err.to_string(), path)
                         }
-                        files.push((file.unwrap(), Some(Path::new(&path).file_name().unwrap().to_str().unwrap().to_string())));
+                        files.push(Upload {
+                            file: file.unwrap(),
+                            name: Path::new(&path).file_name().unwrap().to_str().unwrap().to_string(),
+                            duration: info.default_duration.clone() as i64
+                        })
                     }
+                    if let Some(dur) = duration_all {
+                        for file in files.iter_mut() {
+                            file.duration = dur as i64;
+                        }
+                    }
+
                     let client = Client::new();
                     let results = Mutex::new(vec![]);
                     moro_local::async_scope!(|s| {
-                        for (file, name) in files {
+                        for Upload { file, name, duration } in files {
+                            let dur = AtomicI64::new(duration.clone());
                             s.spawn(async {
-                                let file = upload_file(name.unwrap(), file, &client, url.clone(), None, &config).await.unwrap();
+                                let file = upload_file(name, file, &client, url.clone(), dur, &config).await.unwrap();
                                 results.lock().await.push(file);
                             });
                         }
@@ -75,7 +138,7 @@ async fn main() -> Result<(), String> {
                     let res = results.into_inner();
 
                     for file in res {
-                        println!("\nname: {}\npath: {url}/f/{}", file.name, file.mmid.0);
+                        println!("\nname: {}  |  valid until: {}\npath: {url}/f/{}", file.name, file.expiry_datetime, file.mmid.0);
                     }
 
                     return Ok(());
@@ -111,7 +174,7 @@ async fn main() -> Result<(), String> {
     Ok(())
 }
 
-async fn upload_file(name: String, file: File, client: &Client, url: String, duration: Option<i64>, config: &Config) -> Result<MochiFile, ()> {
+async fn upload_file(name: String, file: File, client: &Client, url: String, duration: AtomicI64, config: &Config) -> Result<MochiFile, ()> {
     let mut bytes = vec![];
     let mut file = file;
     let (user, pass) = (config.login.as_ref().unwrap().user.clone(), config.login.as_ref().unwrap().pass.clone());
@@ -123,7 +186,7 @@ async fn upload_file(name: String, file: File, client: &Client, url: String, dur
                     &ChunkedInfo {
                         name: name.clone(),
                         size: bytes.len() as u64,
-                        expire_duration: if let Some(dur) = duration { dur } else { config.info.as_ref().unwrap().default_duration.clone() as i64 }
+                        expire_duration: duration.load(std::sync::atomic::Ordering::Relaxed)
                     }
                 ).basic_auth(&user, pass.clone())
                 .send()
@@ -174,7 +237,7 @@ async fn upload_file(name: String, file: File, client: &Client, url: String, dur
     )
 }
 
-async fn set(mut args: Args, mut config: Config) {
+async fn set(args: Args, mut config: Config) {
     let mut args = args.peekable();
     if args.peek().is_none() {
         panic!("shouldn't have done that. give me something to set")
@@ -245,16 +308,8 @@ fn help() {
 #[derive(Debug)]
 struct Upload {
     file: File,
-    duration: String,
-    auth: (String, String)
-}
-
-#[derive(Deserialize, Debug)]
-struct FileLocation {
-    pub name: String,
-    pub status: bool,
-    pub url: Option<String>,
-    pub expires: String,
+    name: String,
+    duration: i64,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
