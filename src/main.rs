@@ -1,28 +1,73 @@
-use std::{env::{args, Args}, fs, io::{Read, Write}, path::Path, sync::atomic::AtomicI64};
+use std::{env::{args, Args}, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}, sync::atomic::AtomicI64};
 
 use chrono::{DateTime, Utc};
 
-use reqwest::Client;
+use reqwest::{Body, Client};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt, sync::Mutex};
 use uuid::Uuid;
 use colored::Colorize;
+use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
+
+const CLAP_STYLE: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default())
+    .usage(AnsiColor::Green.on_default())
+    .literal(AnsiColor::Green.on_default())
+    .placeholder(AnsiColor::Green.on_default());
 
 const DEBUG_CONFIG: &str = "test/config.toml";
 
+#[derive(Parser)]
+#[command(name = "confetti_cli")]
+#[command(version, about, long_about = None)]
+#[command(styles = CLAP_STYLE)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// does testing things
+    Upload {
+        /// Filename(s) to upload
+        #[arg(value_name = "file(s)", required = true)]
+        files: Vec<PathBuf>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let mut args= args();
-    let mut config = Config::open().unwrap();
+    let cli = Cli::parse();
+    let config = Config::open().unwrap();
 
-    if args.len() < 2 {
-        help();
-        return Ok(());
+    match &cli.command {
+        Commands::Upload { files } => {
+            let client = Client::new();
+            for file in files {
+                let name = file.file_name().unwrap().to_string_lossy();
+                let response = upload_file(
+                    name.into_owned(),
+                    file,
+                    &client,
+                    &config.url,
+                    3600,
+                    &config
+                ).await.unwrap();
+
+                println!(
+                    "name: {}  |  valid until: {}\npath: {}/f/{}",
+                    response.name,
+                    response.expiry_datetime,
+                    config.url,
+                    response.mmid.0
+                );
+            }
+        }
     }
 
-    let url = config.url.clone();
-
-    let exec_name = Path::new(&args.next().unwrap()).file_name().unwrap().to_str().unwrap().to_string();
+    /*
     if let Some(arg) = args.next() {
         match arg.to_lowercase().as_str() {
             x if x != "set" && url.is_empty() => {
@@ -171,61 +216,75 @@ async fn main() -> Result<(), String> {
             x => {println!(r#"ERROR: "{x}" is an invalid keyword"#)}
         }
     }
+    */
+
     Ok(())
 }
 
-async fn upload_file(name: String, file: File, client: &Client, url: String, duration: AtomicI64, config: &Config) -> Result<MochiFile, ()> {
-    let mut bytes = vec![];
-    let mut file = file;
+#[derive(Error, Debug)]
+enum UploadError {
+    #[error("server returned an error: {0}")]
+    ErrorResponse(u16, String),
+}
+
+async fn upload_file<P: AsRef<Path>>(
+    name: String,
+    path: &P,
+    client: &Client,
+    url: &String,
+    duration: u64,
+    config: &Config
+) -> Result<MochiFile, UploadError> {
+    let mut file = File::open(path).await.unwrap();
+    let size = file.metadata().await.unwrap().size() as u64;
     let (user, pass) = (config.login.as_ref().unwrap().user.clone(), config.login.as_ref().unwrap().pass.clone());
-    file.read_to_end(&mut bytes).await.unwrap();
 
-    let ChunkedResponse {status, message, uuid, chunk_size} = {
+    let ChunkedResponse {status: _, message: _, uuid, chunk_size} = {
         client.post(format!("{url}/upload/chunked/"))
-                .json(
-                    &ChunkedInfo {
-                        name: name.clone(),
-                        size: bytes.len() as u64,
-                        expire_duration: duration.load(std::sync::atomic::Ordering::Relaxed)
-                    }
-                ).basic_auth(&user, pass.clone())
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap()
+            .json(
+                &ChunkedInfo {
+                    name: name.clone(),
+                    size,
+                    expire_duration: duration,
+                }
+            )
+            .basic_auth(&user, pass.clone())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     };
-    // dbg!(status, message, chunk_size);
 
+    let mut i = 0;
+    loop {
+        let mut chunk = vec![0u8; chunk_size as usize];
+        let bytes_read =
+            fill_buffer(&mut chunk, &mut file).await.unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+        dbg!(bytes_read);
+        let chunk = chunk[..bytes_read].to_owned();
 
-    let chunks = bytes.chunks(chunk_size as usize);
-    let len = chunks.len();
-
-    for (i, chunk) in chunks.enumerate() {
-        let url = url.clone();
-            let chunk = chunk.to_vec();
-            let offset = chunk_size * i as u64;
-            let url = format!("{url}/upload/chunked/{uuid}?offset={offset}");
-
-            let res = client.post(url)
+        let post_url = format!("{url}/upload/chunked/{uuid}");
+        let res = client.post(post_url)
+            .query(&[("chunk", i)])
             .basic_auth(&user, pass.clone())
             .body(chunk)
             .send()
             .await
-            .unwrap()
-            .text()
-            .await
             .unwrap();
-            // dbg!(res);
 
-            let completion: u8 = ((i + 1) as f32 / len as f32 * 100.0) as u8;
-            if completion == 100 {
-                println!("🎊 {name} upload complete! 🎊");
-            } else {
-                println!("{name}: {completion}% uploaded");
-            }
+        if res.status() != 200 {
+            return Err(UploadError::ErrorResponse(res.status().as_u16(), res.text().await.unwrap()));
+        }
+
+        println!("{i}");
+        i += 1;
     }
+
     Ok(
         client.get(format!("{url}/upload/chunked/{uuid}?finish"))
         .basic_auth(user, pass)
@@ -235,6 +294,21 @@ async fn upload_file(name: String, file: File, client: &Client, url: String, dur
         .await
         .unwrap()
     )
+}
+
+/// Attempts to fill a buffer completely from a stream, but if it cannot do so,
+/// it will only fill what it can read. If it has reached the end of a file, 0
+/// bytes will be read into the buffer.
+async fn fill_buffer<S: AsyncReadExt + Unpin>(buffer: &mut [u8], mut stream: S) -> Result<usize, io::Error> {
+    let mut bytes_read = 0;
+    while bytes_read < buffer.len() {
+        let len = stream.read(&mut buffer[bytes_read..]).await?;
+        if len == 0 {
+            break;
+        }
+        bytes_read += len;
+    }
+    Ok(bytes_read)
 }
 
 async fn set(args: Args, mut config: Config) {
@@ -324,7 +398,7 @@ struct ServerInfo {
 pub struct ChunkedInfo {
     pub name: String,
     pub size: u64,
-    pub expire_duration: i64,
+    pub expire_duration: u64,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
