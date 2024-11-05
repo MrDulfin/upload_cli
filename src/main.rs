@@ -1,11 +1,11 @@
-use std::{env::{args, Args}, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}, sync::atomic::AtomicI64};
+use std::{env::Args, error::Error, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Local, Month, SubsecRound, TimeDelta, Timelike, Utc};
 
-use reqwest::{Body, Client};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs::File, io::AsyncReadExt, sync::Mutex};
+use tokio::{fs::File, io::AsyncReadExt, task::JoinSet};
 use uuid::Uuid;
 use colored::Colorize;
 use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
@@ -34,6 +34,10 @@ enum Commands {
         /// Filename(s) to upload
         #[arg(value_name = "file(s)", required = true)]
         files: Vec<PathBuf>,
+
+        /// Expiration length of the uploaded file
+        #[arg(short, long, default_value = "6h")]
+        duration: String,
     },
 }
 
@@ -43,23 +47,35 @@ async fn main() -> Result<(), String> {
     let config = Config::open().unwrap();
 
     match &cli.command {
-        Commands::Upload { files } => {
+        Commands::Upload { files, duration } => {
             let client = Client::new();
-            for file in files {
-                let name = file.file_name().unwrap().to_string_lossy();
+            let duration = match parse_time_string(&duration) {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Invalid duration: {e}")),
+            };
+            for path in files {
+                let name = path.file_name().unwrap().to_string_lossy();
                 let response = upload_file(
                     name.into_owned(),
-                    file,
+                    path,
                     &client,
                     &config.url,
-                    3600,
+                    duration,
                     &config
-                ).await.unwrap();
+                ).await.map_err(|e| e.to_string())?;
 
+                let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
+                let date = format!(
+                    "{} {}",
+                    Month::try_from(u8::try_from(datetime.month()).unwrap()).unwrap().name(),
+                    datetime.day(),
+                );
+                let time = format!("{}:{}", datetime.hour(), datetime.minute());
                 println!(
-                    "name: {}  |  valid until: {}\npath: {}/f/{}",
+                    "Name: {}  |  Valid until: {} {}\npath: {}/f/{}",
                     response.name,
-                    response.expiry_datetime,
+                    date,
+                    time,
                     config.url,
                     response.mmid.0
                 );
@@ -67,164 +83,19 @@ async fn main() -> Result<(), String> {
         }
     }
 
-    /*
-    if let Some(arg) = args.next() {
-        match arg.to_lowercase().as_str() {
-            x if x != "set" && url.is_empty() => {
-                println!("Please set a url with {}.", format!("{} set url <url>", exec_name).as_str().bold());
-            }
-            "upload" => {
-                if let Some(path) = args.next() {
-                    let mut first = true;
-                    let mut files: Vec<Upload> = vec![];
-                    let info = config.info.as_ref().unwrap();
-                    let mut duration_all = None;
-                    loop {
-                        let path: String = if !first {
-                            match args.next() {
-                                Some(arg) => match arg.to_lowercase().as_str() {
-                                    x if x == "-n" || x == "--name" => {
-                                        let file_name = match args.next() {
-                                            Some(arg) => arg,
-                                            None => {
-                                                println!("ERROR: Provide a file name");
-                                                return Ok(());
-                                            }
-                                        };
-                                        files.last_mut().unwrap().name = file_name;
-                                        continue;
-                                    },
-                                    x if x == "-d" || x == "--duration" => {
-                                        match args.next() {
-                                            Some(dur) => {
-                                                if let Ok(dur) = dur.parse::<u32>() {
-                                                    if info.allowed_durations.contains(&dur) {
-                                                        files.last_mut().unwrap().duration = dur as i64;
-                                                    } else {
-                                                        print!("ERROR: {} is not a supported duration.\nPlease choose from ", dur.to_string().bold());
-                                                        let len = info.allowed_durations.len();
-                                                        for (i, dur_) in info.allowed_durations.iter().enumerate() {
-                                                            print!("{}{}",dur_.to_string().bold(), if i+1 < len { ", " } else { ".\n" });
-                                                        }
-                                                        return Ok(());
-                                                    }
-                                                } else {
-                                                    println!("ERROR: Provide a valid duration");
-                                                    return Ok(());
-                                                }
-                                            },
-                                            None => {
-                                                println!("ERROR: Provide a valid duration");
-                                                return Ok(());
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    x if x == "-da" || x == "--duration-all" => {
-                                        if let Some(dur) = args.next() {
-                                            if let Ok(dur) = dur.parse::<u32>() {
-                                                if info.allowed_durations.contains(&dur) {
-                                                    duration_all = Some(dur);
-                                                } else {
-                                                    print!("ERROR: {} is not a supported duration.\nPlease choose from ", dur.to_string().bold());
-                                                    let len = info.allowed_durations.len();
-                                                    for (i, dur_) in info.allowed_durations.iter().enumerate() {
-                                                        print!("{}{}",dur_.to_string().bold(), if i+1 < len { ", " } else { ".\n" });
-                                                    }
-                                                    return Ok(());
-                                                }
-
-                                            } else {
-                                                println!("ERROR: Provide a valid duration");
-                                                return Ok(());
-                                            }
-                                        } else {
-                                            println!("ERROR: Provide a valid duration");
-                                            return Ok(());
-                                        }
-                                        continue;
-                                    }
-                                    _ => arg
-                                },
-                                None => break
-                            }
-                        } else {
-                            first = false;
-                            path.clone()
-                        };
-                        let file = tokio::fs::OpenOptions::new().read(true).open(&path).await;
-                        if let Err(err) = file {
-                            panic!("{} {}", err.to_string(), path)
-                        }
-                        files.push(Upload {
-                            file: file.unwrap(),
-                            name: Path::new(&path).file_name().unwrap().to_str().unwrap().to_string(),
-                            duration: info.default_duration.clone() as i64
-                        })
-                    }
-                    if let Some(dur) = duration_all {
-                        for file in files.iter_mut() {
-                            file.duration = dur as i64;
-                        }
-                    }
-
-                    let client = Client::new();
-                    let results = Mutex::new(vec![]);
-                    moro_local::async_scope!(|s| {
-                        for Upload { file, name, duration } in files {
-                            let dur = AtomicI64::new(duration.clone());
-                            s.spawn(async {
-                                let file = upload_file(name, file, &client, url.clone(), dur, &config).await.unwrap();
-                                results.lock().await.push(file);
-                            });
-                        }
-                    }).await;
-
-                    let res = results.into_inner();
-
-                    for file in res {
-                        println!("\nname: {}  |  valid until: {}\npath: {url}/f/{}", file.name, file.expiry_datetime, file.mmid.0);
-                    }
-
-                    return Ok(());
-                } else {
-                    return Err("Please provide at least 1 file to upload".to_string());
-                }
-            },
-            "download" => {todo!()}
-            "files" => {todo!()}
-            "set" => {
-                set(args, config).await
-            }
-            "info" => {
-                let client = Client::new();
-                let info = client.get(
-                    format!("{url}/info"))
-                    .basic_auth(
-                        config.login.as_ref().unwrap().user.clone(),
-                        config.login.as_ref().unwrap().pass.clone()
-                    ).send()
-                    .await
-                    .unwrap()
-                    .json::<ServerInfo>()
-                    .await
-                    .unwrap();
-
-                config.info = Some(info);
-                config.save().unwrap();
-            }
-            x => {println!(r#"ERROR: "{x}" is an invalid keyword"#)}
-        }
-    }
-    */
-
     Ok(())
 }
 
 #[derive(Error, Debug)]
 enum UploadError {
     #[error("server returned an error: {0}")]
-    ErrorResponse(u16, String),
+    ErrorStatus(u16, String),
+
+    #[error("request provided was invalid: {0}")]
+    InvalidRequest(String),
+
+    #[error("error on reqwest transaction: {0}")]
+    Reqwest(#[from] reqwest::Error),
 }
 
 async fn upload_file<P: AsRef<Path>>(
@@ -232,68 +103,90 @@ async fn upload_file<P: AsRef<Path>>(
     path: &P,
     client: &Client,
     url: &String,
-    duration: u64,
+    duration: TimeDelta,
     config: &Config
 ) -> Result<MochiFile, UploadError> {
     let mut file = File::open(path).await.unwrap();
     let size = file.metadata().await.unwrap().size() as u64;
     let (user, pass) = (config.login.as_ref().unwrap().user.clone(), config.login.as_ref().unwrap().pass.clone());
 
-    let ChunkedResponse {status: _, message: _, uuid, chunk_size} = {
+    let ChunkedResponse {status, message, uuid, chunk_size} = {
         client.post(format!("{url}/upload/chunked/"))
             .json(
                 &ChunkedInfo {
                     name: name.clone(),
                     size,
-                    expire_duration: duration,
+                    expire_duration: duration.num_seconds() as u64,
                 }
             )
             .basic_auth(&user, pass.clone())
             .send()
-            .await
-            .unwrap()
+            .await?
             .json()
-            .await
-            .unwrap()
+            .await?
     };
 
+    if !status {
+        return Err(UploadError::InvalidRequest(message));
+    }
+
     let mut i = 0;
+    let post_url = format!("{url}/upload/chunked/{}", uuid.unwrap());
+    let mut request_set = JoinSet::new();
     loop {
-        let mut chunk = vec![0u8; chunk_size as usize];
-        let bytes_read =
-            fill_buffer(&mut chunk, &mut file).await.unwrap();
+        // Read the next chunk into a buffer
+        let mut chunk = vec![0u8; chunk_size.unwrap() as usize];
+        let bytes_read = fill_buffer(&mut chunk, &mut file).await.unwrap();
         if bytes_read == 0 {
             break;
         }
-        dbg!(bytes_read);
         let chunk = chunk[..bytes_read].to_owned();
 
-        let post_url = format!("{url}/upload/chunked/{uuid}");
-        let res = client.post(post_url)
-            .query(&[("chunk", i)])
-            .basic_auth(&user, pass.clone())
-            .body(chunk)
-            .send()
-            .await
-            .unwrap();
+        request_set.spawn({
+            let post_url = post_url.clone();
+            let user = user.clone();
+            let pass = pass.clone();
+            // Reuse the client for all the threads
+            let client = Client::clone(client);
 
-        if res.status() != 200 {
-            return Err(UploadError::ErrorResponse(res.status().as_u16(), res.text().await.unwrap()));
-        }
+            async move {
+                client.post(&post_url)
+                    .query(&[("chunk", i)])
+                    .basic_auth(&user, pass.as_ref())
+                    .body(chunk)
+                    .send()
+                    .await
+            }
+        });
 
-        println!("{i}");
         i += 1;
+
+        // Limit the number of concurrent uploads to 5
+        if request_set.len() >= 5 {
+            println!("Waiting...");
+            request_set.join_next().await;
+        }
     }
 
-    Ok(
-        client.get(format!("{url}/upload/chunked/{uuid}?finish"))
+    // Wait for all remaining uploads to finish
+    loop {
+        if let Some(t) = request_set.join_next().await {
+            match t {
+                Ok(_) => (),
+                Err(_) => todo!(),
+            }
+        } else {
+            break
+        }
+    }
+
+
+    Ok(client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
         .basic_auth(user, pass)
         .send()
         .await.unwrap()
         .json::<MochiFile>()
-        .await
-        .unwrap()
-    )
+        .await?)
 }
 
 /// Attempts to fill a buffer completely from a stream, but if it cannot do so,
@@ -375,10 +268,6 @@ async fn set(args: Args, mut config: Config) {
     }
 }
 
-fn help() {
-    println!("no");
-}
-
 #[derive(Debug)]
 struct Upload {
     file: File,
@@ -407,10 +296,10 @@ pub struct ChunkedResponse {
     message: String,
 
     /// UUID used for associating the chunk with the final file
-    uuid: Uuid,
+    uuid: Option<Uuid>,
 
     /// Valid max chunk size in bytes
-    chunk_size: u64,
+    chunk_size: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -534,3 +423,35 @@ impl Config {
     }
 }
 
+pub fn parse_time_string(string: &str) -> Result<TimeDelta, Box<dyn Error>> {
+    if string.len() > 7 {
+        return Err("Not valid time string".into());
+    }
+
+    let unit = string.chars().last();
+    let multiplier = if let Some(u) = unit {
+        if !u.is_ascii_alphabetic() {
+            return Err("Not valid time string".into());
+        }
+
+        match u {
+            'D' | 'd' => TimeDelta::days(1),
+            'H' | 'h' => TimeDelta::hours(1),
+            'M' | 'm' => TimeDelta::minutes(1),
+            'S' | 's' => TimeDelta::seconds(1),
+            _ => return Err("Not valid time string".into()),
+        }
+    } else {
+        return Err("Not valid time string".into());
+    };
+
+    let time = if let Ok(n) = string[..string.len() - 1].parse::<i32>() {
+        n
+    } else {
+        return Err("Not valid time string".into());
+    };
+
+    let final_time = multiplier * time;
+
+    Ok(final_time)
+}
