@@ -1,13 +1,13 @@
 use std::{env::Args, error::Error, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 
-use chrono::{DateTime, Datelike, Local, Month, SubsecRound, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Datelike, Local, Month, TimeDelta, Timelike, Utc};
 
+use owo_colors::OwoColorize as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt, task::JoinSet};
 use uuid::Uuid;
-use colored::Colorize;
 use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
 
 const CLAP_STYLE: Styles = Styles::styled()
@@ -72,12 +72,10 @@ async fn main() -> Result<(), String> {
                 );
                 let time = format!("{}:{}", datetime.hour(), datetime.minute());
                 println!(
-                    "Name: {}  |  Valid until: {} {}\npath: {}/f/{}",
-                    response.name,
-                    date,
-                    time,
-                    config.url,
-                    response.mmid.0
+                    "{:>8} \"{}\"\n{:>8} {}, {}\n{:>8} {}/f/{}",
+                    "Name:".bright_green(), response.name,
+                    "Expires:".bright_green(), date, time,
+                    "URL:".bright_green(), config.url, response.mmid.0
                 );
             }
         }
@@ -88,9 +86,6 @@ async fn main() -> Result<(), String> {
 
 #[derive(Error, Debug)]
 enum UploadError {
-    #[error("server returned an error: {0}")]
-    ErrorStatus(u16, String),
-
     #[error("request provided was invalid: {0}")]
     InvalidRequest(String),
 
@@ -181,12 +176,14 @@ async fn upload_file<P: AsRef<Path>>(
     }
 
 
-    Ok(client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
-        .basic_auth(user, pass)
-        .send()
-        .await.unwrap()
-        .json::<MochiFile>()
-        .await?)
+    Ok(
+        client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
+            .basic_auth(user, pass)
+            .send()
+            .await.unwrap()
+            .json::<MochiFile>()
+            .await?
+    )
 }
 
 /// Attempts to fill a buffer completely from a stream, but if it cannot do so,
