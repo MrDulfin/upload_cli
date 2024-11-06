@@ -8,6 +8,7 @@ anyhow = "1.0.92"
 chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.20", features = ["derive", "unicode"] }
 directories = "5.0.1"
+indicatif = { version = "0.17.8", features = ["improved_unicode"] }
 owo-colors = "4.1.0"
 reqwest = { version = "0.12.8", features = ["json", "stream"] }
 serde = { version = "1.0.213", features = ["derive"] }

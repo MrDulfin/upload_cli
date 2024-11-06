@@ -2,11 +2,12 @@ use std::{error::Error, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, 
 
 use chrono::{DateTime, Datelike, Local, Month, TimeDelta, Timelike, Utc};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs::File, io::AsyncReadExt, task::JoinSet};
+use tokio::{fs::File, io::AsyncReadExt, task::{spawn_local, JoinSet}};
 use uuid::Uuid;
 use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -55,6 +56,9 @@ enum Commands {
         url: Option<String>,
     },
 
+    /// Get server information manually
+    Info,
+
     /// Download files
     Download {
         /// MMID to download
@@ -69,37 +73,57 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Upload { files, duration } => {
+            get_info_if_expired(&mut config).await?;
+
             let client = Client::new();
             let duration = match parse_time_string(&duration) {
                 Ok(d) => d,
                 Err(e) => return Err(anyhow!("Invalid duration: {e}")),
             };
-            for path in files {
-                println!("Uploading...");
-                let name = path.file_name().unwrap().to_string_lossy();
-                let response = upload_file(
-                    name.into_owned(),
-                    path,
-                    &client,
-                    &config.url,
-                    duration,
-                    &config
-                ).await.with_context(|| "Failed to upload")?;
-                println!("Finished.");
 
-                let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
-                let date = format!(
-                    "{} {}",
-                    Month::try_from(u8::try_from(datetime.month()).unwrap()).unwrap().name(),
-                    datetime.day(),
-                );
-                let time = format!("{}:{}", datetime.hour(), datetime.minute());
-                println!(
-                    "{:>8} \"{}\"\n{:>8} {}, {}\n{:>8} {}/f/{}",
-                    "Name:".bright_blue(), response.name,
-                    "Expires:".bright_blue(), date, time,
-                    "URL:".bright_blue(), config.url, response.mmid.0
-                );
+            if !config.info.as_ref().unwrap().allowed_durations.contains(&duration.num_seconds()) {
+                let pretty_durations: Vec<String> = config.info.as_ref()
+                    .unwrap()
+                    .allowed_durations
+                    .clone()
+                    .iter()
+                    .map(|d| pretty_time_short(*d))
+                    .collect();
+                let mut pretty = String::new();
+                let len = pretty_durations.len() - 1;
+                for (i, d) in pretty_durations.into_iter().enumerate() {
+                    let last = if i == len {""} else {", "};
+                    pretty.push_str(&(d + last));
+                }
+                bail!("Duration not allowed.\nPlease choose from: {pretty}");
+            }
+
+            println!("Uploading...");
+            for path in files {
+                spawn_local(async move {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    let response = upload_file(
+                        name.into_owned(),
+                        path,
+                        &client,
+                        &config.url,
+                        duration,
+                        &config
+                    ).await.with_context(|| "Failed to upload").unwrap();
+
+                    let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
+                    let date = format!(
+                        "{} {}",
+                        Month::try_from(u8::try_from(datetime.month()).unwrap()).unwrap().name(),
+                        datetime.day(),
+                    );
+                    let time = format!("{}:{}", datetime.hour(), datetime.minute());
+                    println!(
+                        "{:>8} {}, {} ({})\n{:>8} {}",
+                        "Expires:".bright_blue().bold(), date, time, pretty_time_long(duration.num_seconds()),
+                        "URL:".bright_blue().bold(), (config.url.clone() + "/f/" + &response.mmid.0).underline()
+                    );
+                });
             }
         }
         Commands::Download { mmid } => {
@@ -150,6 +174,14 @@ async fn main() -> Result<()> {
                 println!("Set URL");
             }
         }
+        Commands::Info => {
+            let info = match get_info(&config).await {
+                Ok(i) => i,
+                Err(e) => bail!("Failed getting server info: {e}"),
+            };
+            config.info = Some(info);
+            config.save().unwrap();
+        }
     }
 
     Ok(())
@@ -199,6 +231,10 @@ async fn upload_file<P: AsRef<Path>>(
     let mut i = 0;
     let post_url = format!("{url}/upload/chunked/{}", uuid.unwrap());
     let mut request_set = JoinSet::new();
+    let bar = ProgressBar::new(100);
+    bar.set_style(ProgressStyle::with_template(
+        &format!("{} {{bar:40.cyan/blue}} {{pos:>3}}% {{msg}}", name)
+    ).unwrap());
     loop {
         // Read the next chunk into a buffer
         let mut chunk = vec![0u8; chunk_size.unwrap() as usize];
@@ -229,8 +265,14 @@ async fn upload_file<P: AsRef<Path>>(
 
         // Limit the number of concurrent uploads to 5
         if request_set.len() >= 5 {
-            println!("Waiting...");
+            bar.set_message("");
             request_set.join_next().await;
+            bar.set_message("⏳");
+        }
+
+        let percent = f64::trunc(((i as f64 * chunk_size.unwrap() as f64) / size as f64) * 100.0);
+        if percent <= 100. {
+            bar.set_position(percent as u64);
         }
     }
 
@@ -245,7 +287,8 @@ async fn upload_file<P: AsRef<Path>>(
             break
         }
     }
-
+    bar.finish_and_clear();
+    println!("[{}] - \"{}\"", "✓".bright_green(), name);
 
     Ok(
         client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
@@ -255,6 +298,37 @@ async fn upload_file<P: AsRef<Path>>(
             .json::<MochiFile>()
             .await?
     )
+}
+
+async fn get_info_if_expired(config: &mut Config) -> Result<()> {
+    let now = Utc::now();
+    if !config.info_fetch.is_none() && !config.info_fetch.is_some_and(|e| e <= now) {
+        // Not yet ready to get a new batch of info
+        return Ok(())
+    }
+    println!("{}", "Getting new server info...".green());
+
+    let info = get_info(&config).await?;
+    config.info = Some(info);
+    config.info_fetch = Some(now + TimeDelta::days(2));
+    config.save().unwrap();
+
+    Ok(())
+}
+
+async fn get_info(config: &Config) -> Result<ServerInfo> {
+    let url = config.url.clone();
+    let client = Client::new();
+    let info = client.get(format!("{url}/info"))
+        .basic_auth(
+            config.login.as_ref().unwrap().user.clone(),
+            config.login.as_ref().unwrap().pass.clone().into()
+        ).send()
+        .await?
+        .json::<ServerInfo>()
+        .await?;
+
+    Ok(info)
 }
 
 /// Attempts to fill a buffer completely from a stream, but if it cannot do so,
@@ -282,9 +356,9 @@ struct Upload {
 #[derive(Deserialize, Serialize, Debug)]
 struct ServerInfo {
     max_filesize: u64,
-    max_duration: u32,
-    default_duration: u32,
-    allowed_durations: Vec<u32>,
+    max_duration: i64,
+    default_duration: i64,
+    allowed_durations: Vec<i64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -342,6 +416,8 @@ struct Login {
 struct Config {
     url: String,
     login: Option<Login>,
+    /// The time when the info was last fetched
+    info_fetch: Option<DateTime<Utc>>,
     info: Option<ServerInfo>,
 }
 
@@ -354,6 +430,7 @@ impl Config {
                 let c = Config {
                     url: String::new(),
                     login: None,
+                    info_fetch: None,
                     info: None,
                 };
                 c.save().unwrap();
@@ -386,6 +463,7 @@ impl Config {
                         url: String::new(),
                         login: None,
                         info: None,
+                        info_fetch: None,
                     };
                     c.save().unwrap();
 
@@ -458,4 +536,64 @@ pub fn parse_time_string(string: &str) -> Result<TimeDelta, Box<dyn Error>> {
     let final_time = multiplier * time;
 
     Ok(final_time)
+}
+
+
+pub fn pretty_time_short(seconds: i64) -> String {
+    let days = (seconds as f32 / 86400.0).floor();
+    let hour = ((seconds as f32 - (days * 86400.0)) / 3600.0).floor();
+    let mins = ((seconds as f32 - (hour * 3600.0) - (days * 86400.0)) / 60.0).floor();
+    let secs = seconds as f32 - (hour * 3600.0) - (mins * 60.0) - (days * 86400.0);
+
+    let days = if days > 0. {days.to_string() + "d"} else { "".into() };
+    let hour = if hour > 0. {hour.to_string() + "h"} else { "".into() };
+    let mins = if mins > 0. {mins.to_string() + "m"} else { "".into() };
+    let secs = if secs > 0. {secs.to_string() + "s"} else { "".into() };
+
+    (days + " " + &hour + " " + &mins + " " + &secs)
+    .trim()
+    .to_string()
+}
+
+pub fn pretty_time_long(seconds: i64) -> String {
+    let days = (seconds as f32 / 86400.0).floor();
+    let hour = ((seconds as f32 - (days * 86400.0)) / 3600.0).floor();
+    let mins = ((seconds as f32 - (hour * 3600.0) - (days * 86400.0)) / 60.0).floor();
+    let secs = seconds as f32 - (hour * 3600.0) - (mins * 60.0) - (days * 86400.0);
+
+    let days = if days == 0.0 {
+        "".to_string()
+    } else if days == 1.0 {
+        days.to_string() + " day"
+    } else {
+        days.to_string() + " days"
+    };
+
+    let hour = if hour == 0.0 {
+        "".to_string()
+    } else if hour == 1.0 {
+        hour.to_string() + " hour"
+    } else {
+        hour.to_string() + " hours"
+    };
+
+    let mins = if mins == 0.0 {
+        "".to_string()
+    } else if mins == 1.0 {
+        mins.to_string() + " minute"
+    } else {
+        mins.to_string() + " minutes"
+    };
+
+    let secs = if secs == 0.0 {
+        "".to_string()
+    } else if secs == 1.0 {
+        secs.to_string() + " second"
+    } else {
+        secs.to_string() + " seconds"
+    };
+
+    (days + " " + &hour + " " + &mins + " " + &secs)
+    .trim()
+    .to_string()
 }
