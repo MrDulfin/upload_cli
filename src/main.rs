@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
             }
             if let Some(p) = password {
                 if p.is_empty() {
-                    return Err(anyhow!("Password cannot be blank"));
+                    bail!("Password cannot be blank");
                 }
 
                 if let Some(l) = config.login.as_mut() {
@@ -142,10 +142,12 @@ async fn main() -> Result<()> {
             }
             if let Some(url) = url {
                 if url.is_empty() {
-                    return Err(anyhow!("URL cannot be blank"));
+                    bail!("URL cannot be blank");
                 }
 
                 config.url = url.clone();
+                config.save().unwrap();
+                println!("Set URL");
             }
         }
     }
