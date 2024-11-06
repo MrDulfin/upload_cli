@@ -1,4 +1,4 @@
-use std::{env::Args, error::Error, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
+use std::{error::Error, fs, io::{self, Read, Write}, os::unix::fs::MetadataExt, path::{Path, PathBuf}};
 
 use chrono::{DateTime, Datelike, Local, Month, TimeDelta, Timelike, Utc};
 
@@ -9,12 +9,14 @@ use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt, task::JoinSet};
 use uuid::Uuid;
 use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
+use anyhow::{anyhow, bail, Context as _, Result};
 
 const CLAP_STYLE: Styles = Styles::styled()
-    .header(AnsiColor::Yellow.on_default())
+    .header(AnsiColor::BrightMagenta.on_default().bold())
     .usage(AnsiColor::Green.on_default())
     .literal(AnsiColor::Green.on_default())
-    .placeholder(AnsiColor::Green.on_default());
+    .placeholder(AnsiColor::Cyan.on_default())
+    .error(AnsiColor::Red.on_default());
 
 const DEBUG_CONFIG: &str = "test/config.toml";
 
@@ -29,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// does testing things
+    /// Upload files
     Upload {
         /// Filename(s) to upload
         #[arg(value_name = "file(s)", required = true)]
@@ -39,21 +41,41 @@ enum Commands {
         #[arg(short, long, default_value = "6h")]
         duration: String,
     },
+
+    /// Set config options
+    Set {
+        /// Set the username for a server which requires login
+        #[arg(short, long, required = false)]
+        username: Option<String>,
+        /// Set the password for a server which requires login
+        #[arg(short, long, required = false)]
+        password: Option<String>,
+        /// Set the URL of the server to connect to
+        #[arg(long, required = false)]
+        url: Option<String>,
+    },
+
+    /// Download files
+    Download {
+        /// MMID to download
+        mmid: String,
+    },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), String> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::open().unwrap();
+    let mut config = Config::open().unwrap();
 
     match &cli.command {
         Commands::Upload { files, duration } => {
             let client = Client::new();
             let duration = match parse_time_string(&duration) {
                 Ok(d) => d,
-                Err(e) => return Err(format!("Invalid duration: {e}")),
+                Err(e) => return Err(anyhow!("Invalid duration: {e}")),
             };
             for path in files {
+                println!("Uploading...");
                 let name = path.file_name().unwrap().to_string_lossy();
                 let response = upload_file(
                     name.into_owned(),
@@ -62,7 +84,8 @@ async fn main() -> Result<(), String> {
                     &config.url,
                     duration,
                     &config
-                ).await.map_err(|e| e.to_string())?;
+                ).await.with_context(|| "Failed to upload")?;
+                println!("Finished.");
 
                 let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
                 let date = format!(
@@ -73,10 +96,56 @@ async fn main() -> Result<(), String> {
                 let time = format!("{}:{}", datetime.hour(), datetime.minute());
                 println!(
                     "{:>8} \"{}\"\n{:>8} {}, {}\n{:>8} {}/f/{}",
-                    "Name:".bright_green(), response.name,
-                    "Expires:".bright_green(), date, time,
-                    "URL:".bright_green(), config.url, response.mmid.0
+                    "Name:".bright_blue(), response.name,
+                    "Expires:".bright_blue(), date, time,
+                    "URL:".bright_blue(), config.url, response.mmid.0
                 );
+            }
+        }
+        Commands::Download { mmid } => {
+            todo!();
+        }
+        Commands::Set { username, password, url } => {
+            if let Some(u) = username {
+                if u.is_empty() {
+                    bail!("Username cannot be blank");
+                }
+
+                if let Some(l) = config.login.as_mut() {
+                    l.user = u.clone();
+                } else {
+                    config.login = Login {
+                        user: u.clone(),
+                        pass: "".into()
+                    }.into();
+                }
+
+                config.save().unwrap();
+                println!("Set username")
+            }
+            if let Some(p) = password {
+                if p.is_empty() {
+                    return Err(anyhow!("Password cannot be blank"));
+                }
+
+                if let Some(l) = config.login.as_mut() {
+                    l.pass = p.clone();
+                } else {
+                    config.login = Login {
+                        user: "".into(),
+                        pass: p.clone()
+                    }.into();
+                }
+
+                config.save().unwrap();
+                println!("Set password")
+            }
+            if let Some(url) = url {
+                if url.is_empty() {
+                    return Err(anyhow!("URL cannot be blank"));
+                }
+
+                config.url = url.clone();
             }
         }
     }
@@ -114,7 +183,7 @@ async fn upload_file<P: AsRef<Path>>(
                     expire_duration: duration.num_seconds() as u64,
                 }
             )
-            .basic_auth(&user, pass.clone())
+            .basic_auth(&user, pass.clone().into())
             .send()
             .await?
             .json()
@@ -147,7 +216,7 @@ async fn upload_file<P: AsRef<Path>>(
             async move {
                 client.post(&post_url)
                     .query(&[("chunk", i)])
-                    .basic_auth(&user, pass.as_ref())
+                    .basic_auth(&user, pass.into())
                     .body(chunk)
                     .send()
                     .await
@@ -178,7 +247,7 @@ async fn upload_file<P: AsRef<Path>>(
 
     Ok(
         client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
-            .basic_auth(user, pass)
+            .basic_auth(user, pass.into())
             .send()
             .await.unwrap()
             .json::<MochiFile>()
@@ -199,70 +268,6 @@ async fn fill_buffer<S: AsyncReadExt + Unpin>(buffer: &mut [u8], mut stream: S) 
         bytes_read += len;
     }
     Ok(bytes_read)
-}
-
-async fn set(args: Args, mut config: Config) {
-    let mut args = args.peekable();
-    if args.peek().is_none() {
-        panic!("shouldn't have done that. give me something to set")
-    }
-    loop {
-        if let Some(arg) = args.next() {
-            match arg.to_lowercase().as_str() {
-                x if x == "username" || x == "user" || x == "-u" => {
-                    if let Some(arg) = args.next() {
-                        let login = &mut config.login;
-                        if login.is_some() {
-                            config.login.as_mut().unwrap().user = arg.clone();
-                        } else {
-                            config.login = Some(
-                                Login {
-                                    user: arg.clone(),
-                                    pass: None
-                                }
-                            );
-                        }
-                        config.save().unwrap();
-                        println!("Username set to {}", arg.bold())
-                    } else {
-                        println!("Pleae insert a username");
-                    }
-                }
-                x if x == "password" || x == "pass" || x == "-p" => {
-                    if let Some(arg) = args.next() {
-                        let login = &mut config.login;
-                        if login.is_some() {
-                            config.login.as_mut().unwrap().pass = Some(arg.clone());
-                        } else {
-                            config.login = Some(
-                                Login {
-                                    user: String::new(),
-                                    pass: Some(arg.clone())
-                                }
-                            );
-                        }
-                        config.save().unwrap();
-                        println!("Password set to {}", arg.bold())
-                    } else {
-                        println!("Please insert a password");
-                    }
-                }
-                "url" => {
-                    if let Some(arg) = args.next() {
-                        let arg = arg.trim().trim_end_matches('/').to_string();
-                        config.url = arg.clone();
-                        config.save().unwrap();
-                        println!("Url set to {}", arg.bold())
-                    } else {
-                        println!("Please insert a url");
-                    }
-                },
-                x => println!("Setting \"{x}\" is not a valid setting.\nSettings: username (-u), password (-p), url")
-            }
-        } else {
-            break;
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -327,7 +332,7 @@ pub struct Mmid(String);
 #[derive(Deserialize, Serialize, Debug)]
 struct Login {
     user: String,
-    pass: Option<String>
+    pass: String
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
