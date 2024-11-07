@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Upload { files, duration } => {
+            if config.url.is_empty() {
+                bail!("URL is empty; please set it using the {} command", "set".cyan().bold())
+            }
+
             get_info_if_expired(&mut config).await?;
 
             let client = Client::new();
@@ -100,30 +104,28 @@ async fn main() -> Result<()> {
 
             println!("Uploading...");
             for path in files {
-                spawn_local(async move {
-                    let name = path.file_name().unwrap().to_string_lossy();
-                    let response = upload_file(
-                        name.into_owned(),
-                        path,
-                        &client,
-                        &config.url,
-                        duration,
-                        &config
-                    ).await.with_context(|| "Failed to upload").unwrap();
+                let name = path.file_name().unwrap().to_string_lossy();
+                let response = upload_file(
+                    name.into_owned(),
+                    &path,
+                    &client,
+                    &config.url,
+                    duration,
+                    &config.login
+                ).await.with_context(|| "Failed to upload").unwrap();
 
-                    let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
-                    let date = format!(
-                        "{} {}",
-                        Month::try_from(u8::try_from(datetime.month()).unwrap()).unwrap().name(),
-                        datetime.day(),
-                    );
-                    let time = format!("{}:{}", datetime.hour(), datetime.minute());
-                    println!(
-                        "{:>8} {}, {} ({})\n{:>8} {}",
-                        "Expires:".bright_blue().bold(), date, time, pretty_time_long(duration.num_seconds()),
-                        "URL:".bright_blue().bold(), (config.url.clone() + "/f/" + &response.mmid.0).underline()
-                    );
-                });
+                let datetime: DateTime<Local> = DateTime::from(response.expiry_datetime);
+                let date = format!(
+                    "{} {}",
+                    Month::try_from(u8::try_from(datetime.month()).unwrap()).unwrap().name(),
+                    datetime.day(),
+                );
+                let time = format!("{:02}:{:02}", datetime.hour(), datetime.minute());
+                println!(
+                    "{:>8} {}, {} (in {})\n{:>8} {}",
+                    "Expires:".bright_blue().bold(), date, time, pretty_time_long(duration.num_seconds()),
+                    "URL:".bright_blue().bold(), (config.url.clone() + "/f/" + &response.mmid.0).underline()
+                );
             }
         }
         Commands::Download { mmid } => {
@@ -169,7 +171,13 @@ async fn main() -> Result<()> {
                     bail!("URL cannot be blank");
                 }
 
-                config.url = url.clone();
+                let url = if url.chars().last() == Some('/') {
+                    url.split_at(url.len() - 1).0
+                } else {
+                    url
+                };
+
+                config.url = url.to_string();
                 config.save().unwrap();
                 println!("Set URL");
             }
@@ -202,11 +210,10 @@ async fn upload_file<P: AsRef<Path>>(
     client: &Client,
     url: &String,
     duration: TimeDelta,
-    config: &Config
+    login: &Option<Login>,
 ) -> Result<MochiFile, UploadError> {
     let mut file = File::open(path).await.unwrap();
     let size = file.metadata().await.unwrap().size() as u64;
-    let (user, pass) = (config.login.as_ref().unwrap().user.clone(), config.login.as_ref().unwrap().pass.clone());
 
     let ChunkedResponse {status, message, uuid, chunk_size} = {
         client.post(format!("{url}/upload/chunked/"))
@@ -217,7 +224,7 @@ async fn upload_file<P: AsRef<Path>>(
                     expire_duration: duration.num_seconds() as u64,
                 }
             )
-            .basic_auth(&user, pass.clone().into())
+            .basic_auth(&login.as_ref().unwrap().user, login.as_ref().unwrap().pass.clone().into())
             .send()
             .await?
             .json()
@@ -246,8 +253,8 @@ async fn upload_file<P: AsRef<Path>>(
 
         request_set.spawn({
             let post_url = post_url.clone();
-            let user = user.clone();
-            let pass = pass.clone();
+            let user = login.as_ref().unwrap().user.clone();
+            let pass = login.as_ref().unwrap().pass.clone();
             // Reuse the client for all the threads
             let client = Client::clone(client);
 
@@ -292,7 +299,7 @@ async fn upload_file<P: AsRef<Path>>(
 
     Ok(
         client.get(format!("{url}/upload/chunked/{}?finish", uuid.unwrap()))
-            .basic_auth(user, pass.into())
+            .basic_auth(&login.as_ref().unwrap().user, login.as_ref().unwrap().pass.clone().into())
             .send()
             .await.unwrap()
             .json::<MochiFile>()
@@ -319,14 +326,19 @@ async fn get_info_if_expired(config: &mut Config) -> Result<()> {
 async fn get_info(config: &Config) -> Result<ServerInfo> {
     let url = config.url.clone();
     let client = Client::new();
-    let info = client.get(format!("{url}/info"))
-        .basic_auth(
-            config.login.as_ref().unwrap().user.clone(),
-            config.login.as_ref().unwrap().pass.clone().into()
-        ).send()
-        .await?
-        .json::<ServerInfo>()
-        .await?;
+
+    let get_info = client.get(format!("{url}/info"));
+    let get_info = if let Some(l) = &config.login {
+        get_info.basic_auth(&l.user, l.pass.clone().into())
+    } else {
+        get_info
+    };
+
+    let info = get_info.send().await.unwrap();
+    let info = match info.error_for_status() {
+        Ok(i) => i.json::<ServerInfo>().await?,
+        Err(e) => bail!("Got access denied! Maybe you need a username and password? ({e})"),
+    };
 
     Ok(info)
 }
@@ -405,7 +417,7 @@ pub struct MochiFile {
 #[derive(Deserialize, Serialize)]
 pub struct Mmid(String);
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct Login {
     user: String,
     pass: String
