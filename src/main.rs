@@ -7,17 +7,17 @@ use owo_colors::OwoColorize as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs::File, io::AsyncReadExt, task::{spawn_local, JoinSet}};
+use tokio::{fs::File, io::AsyncReadExt, task::JoinSet};
 use uuid::Uuid;
-use clap::{arg, builder::{styling::AnsiColor, Styles}, Parser, Subcommand};
+use clap::{arg, builder::{styling::RgbColor, Styles}, Parser, Subcommand};
 use anyhow::{anyhow, bail, Context as _, Result};
 
 const CLAP_STYLE: Styles = Styles::styled()
-    .header(AnsiColor::BrightMagenta.on_default().bold())
-    .usage(AnsiColor::Green.on_default())
-    .literal(AnsiColor::Green.on_default())
-    .placeholder(AnsiColor::Cyan.on_default())
-    .error(AnsiColor::Red.on_default());
+    .header(RgbColor::on_default(RgbColor(197,229,207)).italic())
+    .usage(RgbColor::on_default(RgbColor(174,196,223)))
+    .literal(RgbColor::on_default(RgbColor(246,199,219)))
+    .placeholder(RgbColor::on_default(RgbColor(117,182,194)))
+    .error(RgbColor::on_default(RgbColor(181,66,127)).underline());
 
 const DEBUG_CONFIG: &str = "test/config.toml";
 
@@ -74,7 +74,11 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::Upload { files, duration } => {
             if config.url.is_empty() {
-                bail!("URL is empty; please set it using the {} command", "set".cyan().bold())
+                exit_error(
+                    format!("URL is empty"),
+                    Some(format!("Please set it using the {} command", "set".truecolor(246,199,219).bold())),
+                    None,
+                );
             }
 
             get_info_if_expired(&mut config).await?;
@@ -93,13 +97,12 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|d| pretty_time_short(*d))
                     .collect();
-                let mut pretty = String::new();
-                let len = pretty_durations.len() - 1;
-                for (i, d) in pretty_durations.into_iter().enumerate() {
-                    let last = if i == len {""} else {", "};
-                    pretty.push_str(&(d + last));
-                }
-                bail!("Duration not allowed.\nPlease choose from: {pretty}");
+
+                exit_error(
+                    format!("Duration not allowed."),
+                    Some(format!("Please choose from:")),
+                    Some(pretty_durations)
+                );
             }
 
             println!("Uploading...");
@@ -132,9 +135,17 @@ async fn main() -> Result<()> {
             todo!();
         }
         Commands::Set { username, password, url } => {
+            if username.is_none() && password.is_none() && url.is_none() {
+                exit_error(
+                    format!("Please provide an option to set"),
+                    Some(format!("Allowed options:")),
+                    Some(vec!["--username".into(), "--password".into(), "--url".into()]),
+                );
+            }
+
             if let Some(u) = username {
                 if u.is_empty() {
-                    bail!("Username cannot be blank");
+                    exit_error(format!("Username cannot be blank!"), None, None);
                 }
 
                 if let Some(l) = config.login.as_mut() {
@@ -147,11 +158,11 @@ async fn main() -> Result<()> {
                 }
 
                 config.save().unwrap();
-                println!("Set username")
+                println!("Set username to \"{u}\"")
             }
             if let Some(p) = password {
                 if p.is_empty() {
-                    bail!("Password cannot be blank");
+                    exit_error(format!("Password cannot be blank"), None, None);
                 }
 
                 if let Some(l) = config.login.as_mut() {
@@ -168,7 +179,7 @@ async fn main() -> Result<()> {
             }
             if let Some(url) = url {
                 if url.is_empty() {
-                    bail!("URL cannot be blank");
+                    exit_error(format!("URL cannot be blank"), None, None);
                 }
 
                 let url = if url.chars().last() == Some('/') {
@@ -179,13 +190,13 @@ async fn main() -> Result<()> {
 
                 config.url = url.to_string();
                 config.save().unwrap();
-                println!("Set URL");
+                println!("Set URL to \"{url}\"");
             }
         }
         Commands::Info => {
             let info = match get_info(&config).await {
                 Ok(i) => i,
-                Err(e) => bail!("Failed getting server info: {e}"),
+                Err(e) => exit_error(format!("Failed to get server information!"), Some(e.to_string()), None),
             };
             config.info = Some(info);
             config.save().unwrap();
@@ -335,9 +346,21 @@ async fn get_info(config: &Config) -> Result<ServerInfo> {
     };
 
     let info = get_info.send().await.unwrap();
+    if info.status() == 401 {
+        let err = info.error_for_status().unwrap_err();
+        bail!(
+            "Got access denied! Maybe you need a username and password? ({} - {})",
+            err.status().unwrap().as_str(),
+            err.status().unwrap().canonical_reason().unwrap_or_default()
+        )
+    }
     let info = match info.error_for_status() {
         Ok(i) => i.json::<ServerInfo>().await?,
-        Err(e) => bail!("Got access denied! Maybe you need a username and password? ({e})"),
+        Err(e) => bail!(
+            "Network error: ({} - {})",
+            e.status().unwrap().as_str(),
+            e.status().unwrap().canonical_reason().unwrap_or_default()
+        ),
     };
 
     Ok(info)
@@ -517,7 +540,7 @@ impl Config {
     }
 }
 
-pub fn parse_time_string(string: &str) -> Result<TimeDelta, Box<dyn Error>> {
+fn parse_time_string(string: &str) -> Result<TimeDelta, Box<dyn Error>> {
     if string.len() > 7 {
         return Err("Not valid time string".into());
     }
@@ -550,8 +573,7 @@ pub fn parse_time_string(string: &str) -> Result<TimeDelta, Box<dyn Error>> {
     Ok(final_time)
 }
 
-
-pub fn pretty_time_short(seconds: i64) -> String {
+fn pretty_time_short(seconds: i64) -> String {
     let days = (seconds as f32 / 86400.0).floor();
     let hour = ((seconds as f32 - (days * 86400.0)) / 3600.0).floor();
     let mins = ((seconds as f32 - (hour * 3600.0) - (days * 86400.0)) / 60.0).floor();
@@ -567,7 +589,7 @@ pub fn pretty_time_short(seconds: i64) -> String {
     .to_string()
 }
 
-pub fn pretty_time_long(seconds: i64) -> String {
+fn pretty_time_long(seconds: i64) -> String {
     let days = (seconds as f32 / 86400.0).floor();
     let hour = ((seconds as f32 - (days * 86400.0)) / 3600.0).floor();
     let mins = ((seconds as f32 - (hour * 3600.0) - (days * 86400.0)) / 60.0).floor();
@@ -608,4 +630,25 @@ pub fn pretty_time_long(seconds: i64) -> String {
     (days + " " + &hour + " " + &mins + " " + &secs)
     .trim()
     .to_string()
+}
+
+fn exit_error(main_message: String, fix: Option<String>, fix_values: Option<Vec<String>>) -> ! {
+    eprintln!("{}: {main_message}\n", "Error".truecolor(181,66,127).italic().underline());
+
+    if let Some(f) = fix {
+        eprint!("{f} ");
+        if let Some(v) = fix_values {
+            let len = v.len() - 1;
+            for (i, value) in v.iter().enumerate() {
+                eprint!("{}", value.truecolor(234, 129, 100));
+                if i != len {
+                    eprint!(", ");
+                }
+            }
+        }
+        eprintln!("\n");
+    }
+
+    eprintln!("For more information, try '{}'", "--help".truecolor(246,199,219));
+    std::process::exit(1)
 }
