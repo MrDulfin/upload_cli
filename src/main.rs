@@ -126,8 +126,8 @@ async fn main() -> Result<()> {
                 let time = format!("{:02}:{:02}", datetime.hour(), datetime.minute());
                 println!(
                     "{:>8} {}, {} (in {})\n{:>8} {}",
-                    "Expires:".bright_blue().bold(), date, time, pretty_time_long(duration.num_seconds()),
-                    "URL:".bright_blue().bold(), (config.url.clone() + "/f/" + &response.mmid.0).underline()
+                    "Expires:".truecolor(174,196,223).bold(), date, time, pretty_time_long(duration.num_seconds()),
+                    "URL:".truecolor(174,196,223).bold(), (config.url.clone() + "/f/" + &response.mmid.0).underline()
                 );
             }
         }
@@ -324,7 +324,7 @@ async fn get_info_if_expired(config: &mut Config) -> Result<()> {
         // Not yet ready to get a new batch of info
         return Ok(())
     }
-    println!("{}", "Getting new server info...".green());
+    println!("{}", "Getting new server info...".truecolor(255,249,184));
 
     let info = get_info(&config).await?;
     config.info = Some(info);
