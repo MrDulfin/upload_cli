@@ -1,4 +1,4 @@
-a cli to interact with [Confetti-Box](https://github.com/Dangoware/confetti-box/). this repo won't be here long
+a cli to interact with [Confetti-Box](https://github.com/Dangoware/confetti-box/). It's now merged with Confetti-Boc [here](https://github.com/Dangoware/confetti-box/tree/main/confetti-cli)
 
 works in debug and release mode
 
